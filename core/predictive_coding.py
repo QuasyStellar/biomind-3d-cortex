@@ -25,7 +25,7 @@ def act_deriv(z):
 
 class PredictiveCodingNet:
     def __init__(self, dims, relax_steps=20, relax_lr=0.15, weight_lr=0.08, seed=0,
-                 adam=True, beta1=0.9, beta2=0.999, eps=1e-8):
+                 adam=True, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01):
         """dims: [in, hidden1, ..., out]. Всё в чистых тензорах, requires_grad=False.
         adam=True: тот же Adam, что и у backprop-baseline, но применяется к локально
         вычисленному градиенту (outer product ошибки и активности) — это оптимизатор,
@@ -38,6 +38,7 @@ class PredictiveCodingNet:
         self.weight_lr = weight_lr
         self.adam = adam
         self.beta1, self.beta2, self.eps = beta1, beta2, eps
+        self.weight_decay = weight_decay
         self.t = 0
         self.W = [
             torch.randn(dims[l + 1], dims[l], generator=g) * (1.0 / dims[l] ** 0.5)
@@ -51,6 +52,10 @@ class PredictiveCodingNet:
             self.vb = [torch.zeros_like(bb) for bb in self.b]
 
     def _adam_step(self, param, grad, m, v):
+        # AdamW-style decoupled weight decay - без него норма весов росла
+        # неограниченно и релаксация начинала расходиться после ~40 шагов
+        # (energy: 0.076 -> 0.531 при |W|: 19 -> 42) - найдено на sleep-тесте.
+        param.mul_(1 - self.weight_lr * self.weight_decay)
         m.mul_(self.beta1).add_(grad, alpha=1 - self.beta1)
         v.mul_(self.beta2).addcmul_(grad, grad, value=1 - self.beta2)
         m_hat = m / (1 - self.beta1 ** self.t)
