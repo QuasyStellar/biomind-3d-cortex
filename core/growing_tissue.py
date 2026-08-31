@@ -27,7 +27,14 @@ def _perception_kernels(state_dim):
 class GrowingTissue:
     def __init__(self, size=24, state_dim=16, seed=0,
                  neurogenesis_threshold=0.5, apoptosis_threshold=0.05,
-                 dt=0.4, growth_enabled=True):
+                 dt=0.4, growth_enabled=True,
+                 homeostatic=False, ema_decay=0.05, growth_ratio=1.4, decay_ratio=0.3):
+        """homeostatic=True: пороги роста/апоптоза не константы, а BCM-подобная
+        скользящая величина - EMA собственного стресса каждой клетки за её
+        историю. Растёт, если стресс заметно ВЫШЕ своей же недавней нормы
+        (growth_ratio), умирает, если заметно НИЖЕ (decay_ratio) - порог
+        сам подстраивается под масштаб локальной активности, а не задан
+        абсолютной константой, одинаковой для любой интенсивности стимула."""
         g = torch.Generator().manual_seed(seed)
         self.size = size
         self.state_dim = state_dim
@@ -35,6 +42,11 @@ class GrowingTissue:
         self.growth_enabled = growth_enabled
         self.neurogenesis_threshold = neurogenesis_threshold
         self.apoptosis_threshold = apoptosis_threshold
+        self.homeostatic = homeostatic
+        self.ema_decay = ema_decay
+        self.growth_ratio = growth_ratio
+        self.decay_ratio = decay_ratio
+        self.stress_ema = torch.full((1, 1, size, size), 0.15)
 
         self.p_kernels = _perception_kernels(state_dim)
 
@@ -85,12 +97,26 @@ class GrowingTissue:
         stress = torch.norm(state[:, 2:6], p=2, dim=1, keepdim=True)
         state[:, 1:2] = stress
 
+        if self.homeostatic:
+            # Обновляем скользящую норму только там, где ткань жива - у мёртвых
+            # клеток EMA не должна дрейфовать в никуда.
+            self.stress_ema = torch.where(
+                alive_before,
+                (1 - self.ema_decay) * self.stress_ema + self.ema_decay * stress,
+                self.stress_ema,
+            )
+            grow_threshold = self.stress_ema * self.growth_ratio
+            die_threshold = self.stress_ema * self.decay_ratio
+        else:
+            grow_threshold = torch.full_like(stress, self.neurogenesis_threshold)
+            die_threshold = torch.full_like(stress, self.apoptosis_threshold)
+
         if self.growth_enabled:
-            growth_signal = F.avg_pool2d((stress > self.neurogenesis_threshold).float(), 3, stride=1, padding=1)
+            growth_signal = F.avg_pool2d((stress > grow_threshold).float(), 3, stride=1, padding=1)
             new_cells = (growth_signal > 0.15) & can_grow
             state[:, 0:1] = torch.where(new_cells, torch.ones_like(state[:, 0:1]), state[:, 0:1])
 
-            idle = (stress < self.apoptosis_threshold) & alive_before
+            idle = (stress < die_threshold) & alive_before
             state[:, 0:1] = torch.where(idle, state[:, 0:1] * 0.9, state[:, 0:1])
 
         alive_after = state[:, 0:1] > 0.1
