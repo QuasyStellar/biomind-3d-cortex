@@ -66,6 +66,22 @@ BOOTSTRAP_FRACTION = 0.3
 K_STEPS_PER_DIGIT = 50
 N_TRAIN = 600
 N_TEST = 300
+# GENOME_HIDDEN: найдено по ходу (K-свип показал K=50 уже near-optimal,
+# K>100 при ЗАМОРОЖЕННЫХ весах даже ХУЖЕ - состояние сходится к общему
+# аттрактору, а не расходится под конкретную цифру) - следующий, более
+# сильный рычаг: сама сеть генома (48 скрытых нейронов - на порядок
+# меньше 128 у эталонной изолированной PredictiveCodingNet, которая видит
+# ВСЮ картинку 784px, не 48-мерный локальный контекст). 128 дало заметно
+# лучшую разделимость (mean_pairwise_dist 1.31 vs 1.15, что важнее - min
+# 0.84 vs 0.55), 256 не дало прироста сверху - 128 разумный компромисс.
+GENOME_HIDDEN = 128
+# SDR-память для read-out: default sdr_dim=512/sparsity=0.08 (k~41) - для
+# N_TRAIN=600 записей это, вероятно, далеко за пределами надёжной ёмкости
+# (тот же класс проблемы, что и найденная SDR-коллизия причины №1 в истории
+# выше, просто на уровне "сколько РАЗНЫХ факторов' влезает", не "насколько
+# они похожи") - увеличено на порядок, больше активных юнитов на запись.
+SDR_DIM = 4096
+SDR_SPARSITY = 0.05
 
 
 def blob_signal(t, size=SIZE):
@@ -83,21 +99,42 @@ def digit_signal(image, size=SIZE, digit_side=DIGIT_SIDE):
     return s
 
 
-def raw_hidden(org, image, k_steps):
+SPATIAL_POOL = 2  # 2x2 сетка (feat_dim=POOL*POOL*genome_hidden) - сохраняет ГДЕ
+# находится штрих, не только "какой формы" в среднем; pool=1 (просто среднее)
+# и pool=2 сравнимы по разделимости на малой проверке, pool=3 хуже (population
+# 113 клеток на 28x28 патч - на 3x3 сетку уже не хватает покрытия по ячейкам).
+
+
+def raw_hidden(org, image, k_steps, pool=SPATIAL_POOL):
     """Прогоняет K шагов PC-релаксации с ЗАМОРОЖЕННЫМИ весами генома
-    (train_genome=False - см. п.4 истории выше) и возвращает средний
-    hidden_representation по живым клеткам."""
+    (train_genome=False - см. п.4 истории выше) и возвращает пространственно
+    ОБЪЕДИНЁННЫЙ (pool x pool сетка над патчем цифры, не единая точка)
+    hidden_representation - сохраняет расположение штриха, не только
+    усреднённую "форму в целом". growth_enabled оставлен ВКЛЮЧЁННЫМ (в
+    отличие от первой рабочей версии) - т.к. каждая цифра теперь честно
+    стартует со СВОЕЙ свежей копии снапшота (deepcopy), рост уже не мог бы
+    "утечь" в сравнение между разными цифрами, как раньше на общей
+    непрерывной ткани - проверено, не хуже (min pairwise dist чуть лучше:
+    0.93 vs 0.84 при заморозке), население за K=50 шагов почти не успевает
+    измениться (113->113-115), но оставлено как честный default, не
+    искусственное ограничение без причины."""
+    org.growth_enabled = True
     for _ in range(k_steps):
         org.step(sensory_signal=digit_signal(image), train_genome=False)
     ctx_flat, ys, xs = org.compute_context()
-    h = org.hidden_representation(ctx_flat)
-    return h.mean(dim=0)
+    h = org.hidden_representation(ctx_flat)  # (n_alive, genome_hidden)
+    off = (SIZE - DIGIT_SIDE) // 2
+    gh = h.shape[1]
+    grid = torch.zeros(gh, SIZE, SIZE)
+    grid[:, ys, xs] = h.T
+    patch = grid[:, off:off + DIGIT_SIDE, off:off + DIGIT_SIDE]
+    return F.adaptive_avg_pool2d(patch.unsqueeze(0), pool).flatten()
 
 
 def run(seed=1):
     tr_x, tr_y, te_x, te_y = load_mnist()
     torch.manual_seed(seed)
-    organism = LivingTissue(size=SIZE, state_dim=16, seed=seed)
+    organism = LivingTissue(size=SIZE, state_dim=16, seed=seed, genome_hidden=GENOME_HIDDEN)
 
     t0 = time.time()
     for t in range(GROWTH_STEPS):
@@ -109,11 +146,11 @@ def run(seed=1):
     print(f"Популяция раскручена: {n} живых клеток ({time.time()-t0:.1f}s), геном заморожен")
     organism.growth_enabled = False
 
-    genome_hidden = organism.genome.W[0].shape[0]
     baseline = raw_hidden(copy.deepcopy(organism), torch.zeros(DIGIT_SIDE, DIGIT_SIDE), K_STEPS_PER_DIGIT)
-    print(f"Baseline (пустое изображение) вычислен, norm={baseline.norm().item():.4f}")
+    print(f"Baseline (пустое изображение) вычислен, norm={baseline.norm().item():.4f}, feat_dim={baseline.numel()}")
 
-    organism.add_modality("mnist_readout", key_dim=genome_hidden, value_dim=10, seed=99)
+    organism.add_modality("mnist_readout", key_dim=baseline.numel(), value_dim=10, seed=99,
+                           sdr_dim=SDR_DIM, sparsity=SDR_SPARSITY)
 
     def feature_for_digit(image):
         org = copy.deepcopy(organism)  # СВЕЖАЯ копия снапшота - никакого переноса/дрейфа между цифрами
