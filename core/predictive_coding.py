@@ -28,7 +28,7 @@ class PredictiveCodingNet:
                  adam=True, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01,
                  homeostatic_gate=True, gate_fast=0.3, gate_slow=0.02,
                  gate_shrink=0.9, gate_recover=1.02, gate_floor=0.05, w0_mask=None,
-                 wiring_cost=None, wiring_lambda=0.0):
+                 wiring_cost=None, wiring_lambda=0.0, si_enabled=False, si_lambda=1.0, si_damping=0.1):
         """dims: [in, hidden1, ..., out]. Всё в чистых тензорах, requires_grad=False.
 
         w0_mask (dims[1], dims[0]) 0/1-маска на ПЕРВЫЙ слой - дендритная
@@ -51,6 +51,18 @@ class PredictiveCodingNet:
         расстоянию, а не жёсткая маска. Сеть МОЖЕТ использовать дальние связи,
         если они того стоят, просто платит за них - в отличие от w0_mask,
         который их физически запрещает.
+
+        si_enabled/si_lambda/si_damping: Synaptic Intelligence (Zenke et al.
+        2017, веб-поиск 2026-09-01) - защита от катастрофического забывания
+        через per-synapse важность, накапливаемую ОНЛАЙН вдоль траектории
+        обучения (не offline Fisher information, как в EWC - подходит для
+        честного online-обучения без backward()). Каждый вес отслеживает
+        свой "вклад в улучшение" за время задачи (path integral от
+        gW*Δw), на границе задач (si_new_task()) это конвертируется в
+        omega - важность синапса; на следующей задаче важные синапсы
+        получают квадратичный штраф за отклонение от консолидированного
+        значения, пропорциональный omega - защищает их от переписывания
+        новой задачей, не мешая неважным синапсам учиться свободно.
 
         adam=True: тот же Adam, что и у backprop-baseline, но применяется к локально
         вычисленному градиенту (outer product ошибки и активности) — это оптимизатор,
@@ -90,6 +102,13 @@ class PredictiveCodingNet:
             self.W[0] = self.W[0] * self.w0_mask
         self.wiring_cost = wiring_cost
         self.wiring_lambda = wiring_lambda
+        self.si_enabled = si_enabled
+        self.si_lambda = si_lambda
+        self.si_damping = si_damping
+        if self.si_enabled:
+            self.si_omega = [torch.zeros_like(w) for w in self.W]
+            self.si_w_ref = [w.clone() for w in self.W]
+            self.si_path_integral = [torch.zeros_like(w) for w in self.W]
         if adam:
             self.mW = [torch.zeros_like(w) for w in self.W]
             self.vW = [torch.zeros_like(w) for w in self.W]
@@ -111,6 +130,21 @@ class PredictiveCodingNet:
             self.gate = max(self.gate_floor, self.gate * self.gate_shrink)
         else:
             self.gate = min(1.0, self.gate * self.gate_recover)
+
+    def si_new_task(self):
+        """Вызывается на ГРАНИЦЕ задач - консолидирует накопленную вдоль
+        траектории важность (path_integral) в omega (формула Zenke et al.
+        2017: omega += path_integral / (Δw^2 + damping) - вклад веса в
+        улучшение задачи, нормированный на то, насколько сильно он реально
+        изменился), затем сбрасывает reference-веса и path_integral для
+        следующей задачи."""
+        if not self.si_enabled:
+            return
+        for l in range(self.L):
+            delta = self.W[l] - self.si_w_ref[l]
+            self.si_omega[l] += self.si_path_integral[l] / (delta.pow(2) + self.si_damping)
+            self.si_w_ref[l] = self.W[l].clone()
+            self.si_path_integral[l].zero_()
 
     def _adam_step(self, param, grad, m, v, lr):
         # AdamW-style decoupled weight decay - без него норма весов росла
@@ -183,11 +217,25 @@ class PredictiveCodingNet:
                 # т.е. эффективный шаг должен УМЕНЬШАТЬ |W| - вычитаем штраф из gW.
                 gW = gW - self.wiring_lambda * self.wiring_cost * torch.sign(self.W[0])
             gb = delta.mean(dim=0)
+
+            if self.si_enabled:
+                # SI-штраф ЗА пределами gW, которое накапливается в path_integral -
+                # path_integral должен отражать вклад "чистого" локального градиента,
+                # не искажённый собственным же штрафом (Zenke et al. 2017).
+                gW_update = gW - self.si_lambda * self.si_omega[l] * (self.W[l] - self.si_w_ref[l])
+                W_before = self.W[l].clone()
+            else:
+                gW_update = gW
+
             if self.adam:
-                self._adam_step(self.W[l], gW, self.mW[l], self.vW[l], effective_lr)
+                self._adam_step(self.W[l], gW_update, self.mW[l], self.vW[l], effective_lr)
                 self._adam_step(self.b[l], gb, self.mb[l], self.vb[l], effective_lr)
             else:
-                self.W[l] += effective_lr * gW
+                self.W[l] += effective_lr * gW_update
                 self.b[l] += effective_lr * gb
+
+            if self.si_enabled:
+                delta_w = self.W[l] - W_before
+                self.si_path_integral[l] += gW * delta_w
 
         return energy
