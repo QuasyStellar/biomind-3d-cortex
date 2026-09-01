@@ -131,18 +131,26 @@ class PredictiveCodingNet:
         else:
             self.gate = min(1.0, self.gate * self.gate_recover)
 
-    def si_new_task(self):
+    def si_new_task(self, omega_decay=1.0):
         """Вызывается на ГРАНИЦЕ задач - консолидирует накопленную вдоль
         траектории важность (path_integral) в omega (формула Zenke et al.
         2017: omega += path_integral / (Δw^2 + damping) - вклад веса в
         улучшение задачи, нормированный на то, насколько сильно он реально
         изменился), затем сбрасывает reference-веса и path_integral для
-        следующей задачи."""
+        следующей задачи.
+
+        omega_decay<1.0 (не в оригинальной статье Zenke - наше расширение,
+        тестируем гипотезу про 3+ задачи, см. VERIFICATION_LOG): omega
+        накапливается БЕЗ затухания в оригинальной формуле - к 3-й границе
+        задач у многих весов огромная накопленная важность, что может
+        делать сеть слишком ригидной для консолидации НОВОЙ защиты.
+        omega_decay умножает старое omega ПЕРЕД добавлением нового вклада -
+        "забывание важности", аналог затухания consolidation strength."""
         if not self.si_enabled:
             return
         for l in range(self.L):
             delta = self.W[l] - self.si_w_ref[l]
-            self.si_omega[l] += self.si_path_integral[l] / (delta.pow(2) + self.si_damping)
+            self.si_omega[l] = self.si_omega[l] * omega_decay + self.si_path_integral[l] / (delta.pow(2) + self.si_damping)
             self.si_w_ref[l] = self.W[l].clone()
             self.si_path_integral[l].zero_()
 
