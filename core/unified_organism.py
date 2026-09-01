@@ -322,6 +322,31 @@ class LivingTissue:
         self.state = state * alive_after.float()
         return int(alive_after.sum().item()), float(error_norm.mean().item())
 
+    # --- JEPA-понимание, слито из jepa_understanding_sanity.py (приоритет a):
+    # геном уже обучается self-supervised предсказанию себя по контексту
+    # (тот же принцип, что маскированный токен в тексте) - его СКРЫТОЕ
+    # представление доступно снаружи для downstream-задач, которым геном
+    # никогда явно не обучался, без дублирования логики вычисления context. ---
+    def compute_context(self):
+        """(ctx_flat, ys, xs) для ТЕКУЩЕГО состояния - тот же контекст,
+        что скармливается геному в step(), доступный отдельно для внешнего
+        анализа представлений."""
+        alive, _ = self.alive_mask()
+        p_pad = F.pad(self.state, (1, 1, 1, 1), mode="circular")
+        ctx = F.conv2d(p_pad, self.ctx_kernels, groups=self.state_dim)
+        ys, xs = torch.where(alive[0, 0])
+        ctx_flat = ctx[0, :, ys, xs].T
+        return ctx_flat, ys, xs
+
+    def hidden_representation(self, ctx_flat):
+        """Скрытое представление первого слоя генома - self-supervised
+        представление (см. jepa_understanding_sanity.py: тот же приём -
+        активация скрытого слоя сети, обученной предсказывать маскированную
+        часть входа по остальному, полезна для downstream-классификации,
+        которой сеть никогда явно не обучалась)."""
+        z1 = ctx_flat @ self.genome.W[0].T + self.genome.b[0]
+        return torch.tanh(z1)
+
     # --- Быстрая память: приоритет по силе метки (synaptic tagging) ---
     def write_fact(self, key, value, tag_strength=1.0, beta=0.9):
         """tag_strength - сила метки (0..~2), пропорциональна новизне/ошибке
