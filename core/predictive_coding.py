@@ -27,7 +27,8 @@ class PredictiveCodingNet:
     def __init__(self, dims, relax_steps=20, relax_lr=0.15, weight_lr=0.08, seed=0,
                  adam=True, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01,
                  homeostatic_gate=True, gate_fast=0.3, gate_slow=0.02,
-                 gate_shrink=0.9, gate_recover=1.02, gate_floor=0.05, w0_mask=None):
+                 gate_shrink=0.9, gate_recover=1.02, gate_floor=0.05, w0_mask=None,
+                 wiring_cost=None, wiring_lambda=0.0):
         """dims: [in, hidden1, ..., out]. Всё в чистых тензорах, requires_grad=False.
 
         w0_mask (dims[1], dims[0]) 0/1-маска на ПЕРВЫЙ слой - дендритная
@@ -39,6 +40,18 @@ class PredictiveCodingNet:
         параметров, структура ближе к реальному дендритному дереву. Маска
         применяется к градиенту КАЖДЫЙ шаг (не только при инициализации) -
         иначе замаскированные веса "прорастут" обратно через Adam-момент.
+
+        wiring_cost (dims[1], dims[0]) + wiring_lambda: МЯГКАЯ альтернатива
+        w0_mask (веб-поиск 2026-09-01: "wiring cost" - коннектомика, реальные
+        связи мозга штрафуются пропорционально физическому расстоянию, не
+        жёстко обнуляются - протяжённые связи РЕДКИ, но не запрещены).
+        wiring_cost[h,i] - расстояние между позицией скрытого нейрона h и
+        входа i; каждый шаг к градиенту первого слоя добавляется
+        wiring_lambda * wiring_cost * sign(W[0]) - L1-штраф, пропорциональный
+        расстоянию, а не жёсткая маска. Сеть МОЖЕТ использовать дальние связи,
+        если они того стоят, просто платит за них - в отличие от w0_mask,
+        который их физически запрещает.
+
         adam=True: тот же Adam, что и у backprop-baseline, но применяется к локально
         вычисленному градиенту (outer product ошибки и активности) — это оптимизатор,
         не backprop; сам градиент по-прежнему не требует .backward().
@@ -75,6 +88,8 @@ class PredictiveCodingNet:
         self.w0_mask = w0_mask
         if self.w0_mask is not None:
             self.W[0] = self.W[0] * self.w0_mask
+        self.wiring_cost = wiring_cost
+        self.wiring_lambda = wiring_lambda
         if adam:
             self.mW = [torch.zeros_like(w) for w in self.W]
             self.vW = [torch.zeros_like(w) for w in self.W]
@@ -161,6 +176,12 @@ class PredictiveCodingNet:
             gW = (delta.T @ xs[l]) / B
             if l == 0 and self.w0_mask is not None:
                 gW = gW * self.w0_mask  # маскированные "дендритные" связи не растут через градиент
+            if l == 0 and self.wiring_cost is not None and self.wiring_lambda > 0:
+                # wiring cost - мягкий L1-штраф пропорционально расстоянию (коннектомика),
+                # градиент прибавляем (не вычитаем) - сама Adam-обновление ниже прибавляет
+                # +lr*gW, а нам нужно ТОЛКАТЬ W к нулю пропорционально знаку W и расстоянию,
+                # т.е. эффективный шаг должен УМЕНЬШАТЬ |W| - вычитаем штраф из gW.
+                gW = gW - self.wiring_lambda * self.wiring_cost * torch.sign(self.W[0])
             gb = delta.mean(dim=0)
             if self.adam:
                 self._adam_step(self.W[l], gW, self.mW[l], self.vW[l], effective_lr)
