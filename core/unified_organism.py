@@ -58,6 +58,14 @@ class LivingTissue:
         self.growth_ema_decay = 0.01
         self.growth_period = 10
         self.growth_ema = torch.full((1, 1, size, size), 0.15)
+        # "Воспаление" - временный, локальный сигнал вокруг свежей раны,
+        # понижающий порог роста именно там и затухающий со временем.
+        # Не глобальная и не постоянная поправка (иначе вернём разгон) -
+        # реальное заживление раны тоже работает через временную локальную
+        # сенсибилизацию к факторам роста, не через постоянно другой порог.
+        self.inflammation = torch.zeros(1, 1, size, size)
+        self.inflammation_decay = 0.96
+        self.inflammation_threshold_drop = 0.9  # доля понижения порога в пике воспаления
         self.size = size
         self.state_dim = state_dim
         self.dt = dt
@@ -219,8 +227,12 @@ class LivingTissue:
         self._step_count += 1
         evaluate_growth = self.growth_enabled and (self._step_count % self.growth_period == 0)
 
+        # Воспаление затухает каждый шаг (временное, не постоянное).
+        self.inflammation = self.inflammation * self.inflammation_decay
+        local_grow_th = grow_th_fixed * (1.0 - self.inflammation_threshold_drop * self.inflammation)
+
         if evaluate_growth:
-            growth_signal = F.avg_pool2d((self.growth_ema > grow_th_fixed).float(), 3, stride=1, padding=1)
+            growth_signal = F.avg_pool2d((self.growth_ema > local_grow_th).float(), 3, stride=1, padding=1)
             candidates = (growth_signal > 0.15) & can_grow & ~alive_before
             state[:, 0:1] = torch.where(candidates | alive_before, torch.ones_like(state[:, 0:1]), state[:, 0:1])
         if self.growth_enabled:
@@ -256,6 +268,12 @@ class LivingTissue:
         x0, x1 = max(0, c - half), min(self.size, c - half + block_side)
         killed = int(self.state[0, 0, y0:y1, x0:x1].gt(0.1).sum().item())
         self.state[:, :, y0:y1, x0:x1] = 0.0
+        # Воспаление помечает зону раны И небольшую кайму вокруг (+2 клетки) -
+        # именно выжившие пограничные клетки должны прорастать в рану,
+        # поэтому сенсибилизировать нужно их, а не только мёртвую область.
+        my0, my1 = max(0, y0 - 2), min(self.size, y1 + 2)
+        mx0, mx1 = max(0, x0 - 2), min(self.size, x1 + 2)
+        self.inflammation[:, :, my0:my1, mx0:mx1] = 1.0
         return killed
 
     def clone(self):
