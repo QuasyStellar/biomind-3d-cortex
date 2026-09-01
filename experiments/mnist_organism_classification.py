@@ -74,6 +74,14 @@ N_TRAIN = 2000  # УВЕЛИЧЕНО с 600 (по просьбе "что нуж�
 # статистически маловато; 2000 - тот же масштаб, что в эталонном
 # изолированном протоколе (mnist_pc_vs_backprop_sanity.py)
 N_TEST = 500
+# FIRE_RATE: найдено сверкой с референсным кодом оригинальной Growing NCA
+# (fire_rate=0.5 у авторов). N_train=300: 0.7 выглядел лучше (57.3% vs
+# 50.0% у default=1.0) - НЕ ПОДТВЕРДИЛОСЬ на полном масштабе (N_train=2000:
+# 67.2% против 69.0% у fire_rate=1.0 - ХУЖЕ) - честный артефакт маленькой
+# выборки (rule 4), см. VERIFICATION_LOG. Оставлен default=1.0 (лучший
+# подтверждённый результат сессии), fire_rate остаётся в core/unified_organism.py
+# как проверенный механизм, просто не используется здесь по умолчанию.
+FIRE_RATE = 1.0
 # GENOME_HIDDEN: найдено по ходу (K-свип показал K=50 уже near-optimal,
 # K>100 при ЗАМОРОЖЕННЫХ весах даже ХУЖЕ - состояние сходится к общему
 # аттрактору, а не расходится под конкретную цифру) - следующий, более
@@ -159,7 +167,7 @@ def raw_hidden(org, image, k_steps, pool=SPATIAL_POOL):
 def run(seed=1):
     tr_x, tr_y, te_x, te_y = load_mnist()
     torch.manual_seed(seed)
-    organism = LivingTissue(size=SIZE, state_dim=16, seed=seed, genome_hidden=GENOME_HIDDEN)
+    organism = LivingTissue(size=SIZE, state_dim=16, seed=seed, genome_hidden=GENOME_HIDDEN, fire_rate=FIRE_RATE)
 
     t0 = time.time()
     for t in range(GROWTH_STEPS):
