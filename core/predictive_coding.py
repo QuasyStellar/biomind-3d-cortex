@@ -28,7 +28,8 @@ class PredictiveCodingNet:
                  adam=True, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01,
                  homeostatic_gate=True, gate_fast=0.3, gate_slow=0.02,
                  gate_shrink=0.9, gate_recover=1.02, gate_floor=0.05, w0_mask=None,
-                 wiring_cost=None, wiring_lambda=0.0, si_enabled=False, si_lambda=1.0, si_damping=0.1):
+                 wiring_cost=None, wiring_lambda=0.0, si_enabled=False, si_lambda=1.0, si_damping=0.1,
+                 feedback_alignment=False):
         """dims: [in, hidden1, ..., out]. Всё в чистых тензорах, requires_grad=False.
 
         w0_mask (dims[1], dims[0]) 0/1-маска на ПЕРВЫЙ слой - дендритная
@@ -68,6 +69,18 @@ class PredictiveCodingNet:
         вычисленному градиенту (outer product ошибки и активности) — это оптимизатор,
         не backprop; сам градиент по-прежнему не требует .backward().
 
+        feedback_alignment=False: найдено при критическом аудите (CLAUDE_RESEARCH_SPEC.md,
+        проверено напрямую по коду, не принято на веру) - релаксация (см. train_step)
+        передаёт ошибку вниз через `self.W[l]`, ТУ ЖЕ матрицу, что и прямой проход -
+        это классическая Weight Transport Problem (Crick, 1989): реальный синапс не
+        может точно скопировать вес парного обратного аксона. Fixed Feedback Alignment
+        (Lillicrap et al. 2016, Nature Communications - проверено, реальная статья) -
+        отдельная ФИКСИРОВАННАЯ случайная матрица self.B[l] для обратного прохода,
+        никогда не обновляется. Опционально (default False - точное обратно совместимое
+        поведение с self.W[l], все существующие baseline'ы не затронуты), т.к. Lillicrap
+        показывает СХОДИМОСТЬ близкую к backprop, не гарантированно идентичную - честно
+        нужно перепроверить на наших задачах, не считать решённым по цитате.
+
         homeostatic_gate=True: вместо очередного подбора constant learning
         rate/decay - шаг обучения САМ регулируется по тренду собственной
         энергии релаксации (быстрая EMA против медленной): если энергия
@@ -97,6 +110,12 @@ class PredictiveCodingNet:
             for l in range(self.L)
         ]
         self.b = [torch.zeros(dims[l + 1]) for l in range(self.L)]
+        self.feedback_alignment = feedback_alignment
+        if self.feedback_alignment:
+            self.B = [
+                torch.randn(dims[l + 1], dims[l], generator=g) * (1.0 / dims[l] ** 0.5)
+                for l in range(self.L)
+            ]
         self.w0_mask = w0_mask
         if self.w0_mask is not None:
             self.W[0] = self.W[0] * self.w0_mask
@@ -199,7 +218,10 @@ class PredictiveCodingNet:
                              for l in range(self.L)]
             for l in range(1, self.L):
                 # dF/dx_l = eps_l - W_{l+1}^T (eps_{l+1} * f'(z_{l+1}))
-                upstream = (eps[l + 1] * act_deriv(zs[l + 1])) @ self.W[l]
+                # feedback_alignment: используем ОТДЕЛЬНУЮ фиксированную self.B[l],
+                # не self.W[l] - устраняет Weight Transport Problem (см. __init__).
+                fb = self.B[l] if self.feedback_alignment else self.W[l]
+                upstream = (eps[l + 1] * act_deriv(zs[l + 1])) @ fb
                 grad = eps[l] - upstream
                 xs[l] = xs[l] - self.relax_lr * grad
 
