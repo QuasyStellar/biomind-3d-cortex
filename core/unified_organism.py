@@ -60,7 +60,8 @@ class LivingTissue:
                  predict_chem_only=False, si_enabled=False, si_lambda=1.0,
                  replay_prioritized=False, replay_priority_alpha=0.6,
                  growth_fixed_threshold=None, inflammation_enabled=True, ctx_radius=1,
-                 feedback_alignment=False, small_world_enabled=False, fire_rate=1.0):
+                 feedback_alignment=False, small_world_enabled=False, fire_rate=1.0,
+                 thalamic_router_enabled=False, thalamic_gain=4.0):
         """replay_*: буфер прошлых (контекст, цель) пар вместо обучения только
         на срезе текущего шага - без этого геном не сходится (найдено:
         error 1.07->1.19 за 300 шагов растущей ткани), потому что растущая
@@ -125,6 +126,8 @@ class LivingTissue:
         # драматически сокращает диаметр графа (Watts-Strogatz: O(N)->O(log N)
         # уже при 10% дальних связей), не структурная переделка ядра.
         self.small_world_enabled = small_world_enabled
+        self.thalamic_router_enabled = thalamic_router_enabled
+        self.thalamic_gain = thalamic_gain
         # fire_rate=1.0 (default, ВЕЗДЕ до сих пор) - каждая клетка обновляется
         # КАЖДЫЙ шаг, полностью синхронно. Найдено по критическому аудиту
         # (CLAUDE_RESEARCH_SPEC.md, слабость №9 "синхронный lock-step вместо
@@ -315,8 +318,32 @@ class LivingTissue:
 
     def _small_world_gather(self, state):
         """(1, state_dim, size, size) - каждая позиция (y,x) получает состояние
-        СВОЕГО фиксированного дальнего партнёра (sw_target_y/x), не соседа."""
-        return state[:, :, self.sw_target_y, self.sw_target_x]
+        СВОЕГО фиксированного дальнего партнёра (sw_target_y/x), не соседа.
+
+        thalamic_router_enabled (Halassa & Kastner 2017, проверено WebSearch -
+        реальная статья, обзорная, без явных уравнений - реализация "с нуля"
+        по функциональному описанию, не по формуле из статьи, которой там
+        нет): таламус динамически решает, КАКИЕ межкорковые связи релевантны
+        ПРЯМО СЕЙЧАС, не просто усиливает всё одинаково. Здесь - дальний
+        сигнал ГАСИТСЯ пропорционально тому, НАСКОЛЬКО ОН ПРОТИВОРЕЧИТ
+        локальной химии клетки (cosine similarity между своей и партнёрской
+        chemistry) - доверяем дальнему сигналу, только если он СОГЛАСУЕТСЯ с
+        тем, что клетка уже знает локально, подавляем как шум, если нет.
+        Мотивация: честно найдено (VERIFICATION_LOG, "M11, small-world сами
+        по себе ВРЕДЯТ") - НЕГЕЙТИРОВАННЫЙ случайный дальний сигнал добавляет
+        шум, теория явно требует парный механизм гейтинга, не тестировался
+        отдельно до этой правки."""
+        partner = state[:, :, self.sw_target_y, self.sw_target_x]
+        if self.thalamic_router_enabled:
+            own_chem = state[0, 2:]  # (state_dim-2, size, size)
+            partner_chem = partner[0, 2:]
+            dot = (own_chem * partner_chem).sum(dim=0, keepdim=True)
+            own_norm = own_chem.norm(dim=0, keepdim=True) + 1e-6
+            partner_norm = partner_chem.norm(dim=0, keepdim=True) + 1e-6
+            cos_sim = (dot / (own_norm * partner_norm)).unsqueeze(0)  # (1,1,size,size)
+            gate = torch.sigmoid(cos_sim * self.thalamic_gain)
+            partner = partner * gate
+        return partner
 
     def step(self, sensory_signal=None, train_genome=True):
         alive_before, can_grow = self.alive_mask()
