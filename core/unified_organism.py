@@ -35,7 +35,7 @@ class LivingTissue:
                  ema_decay=0.05, growth_ratio=1.4, decay_ratio=0.3,
                  genome_hidden=48, relax_steps=15, relax_lr=0.08, weight_lr=0.01,
                  replay_capacity=4000, replay_batch=192, replay_min_before_train=192,
-                 predict_chem_only=False):
+                 predict_chem_only=False, si_enabled=False, si_lambda=1.0):
         """replay_*: буфер прошлых (контекст, цель) пар вместо обучения только
         на срезе текущего шага - без этого геном не сходится (найдено:
         error 1.07->1.19 за 300 шагов растущей ткани), потому что растущая
@@ -83,7 +83,8 @@ class LivingTissue:
         self.genome = PredictiveCodingNet(
             [state_dim * 3, genome_hidden, out_dim],
             relax_steps=relax_steps, relax_lr=relax_lr, weight_lr=weight_lr,
-            seed=seed, adam=True, weight_decay=0.02)
+            seed=seed, adam=True, weight_decay=0.02,
+            si_enabled=si_enabled, si_lambda=si_lambda)
 
         # Быстрая ассоциативная память - общая на всю ткань, symmetric delta-rule,
         # с SDR-разреженностью (компонент 2, уже проверено - плотная память без
