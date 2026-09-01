@@ -22,10 +22,32 @@ import torch.nn.functional as F
 from core.predictive_coding import PredictiveCodingNet
 
 
-def _perception_kernels(state_dim):
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32) / 8.0
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32) / 8.0
-    lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32) / 4.0
+def _perception_kernels(state_dim, radius=1):
+    """radius=1 (по умолчанию, ВЕЗДЕ в проекте до сих пор) - точные исходные
+    3x3 Sobel/Laplacian коэффициенты, без изменений (обратная совместимость,
+    численно идентично прежнему поведению). radius>1 - обобщение через
+    производные Гаусса (Sobel/Laplacian-of-Gaussian) того же вида, но на
+    более широком рецептивном поле - нужно для честной проверки гипотезы
+    "геном не различает целую цифру, потому что видит только 1 соседа за
+    шаг" (см. docs/VERIFICATION_LOG.md, "Первая попытка распознавания
+    реальных цифр..." - причина найдена, это прямая проверка её)."""
+    if radius == 1:
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32) / 8.0
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32) / 8.0
+        lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32) / 4.0
+    else:
+        size = 2 * radius + 1
+        ax = torch.arange(size, dtype=torch.float32) - radius
+        yy, xx = torch.meshgrid(ax, ax, indexing="ij")
+        sigma = radius / 2.0
+        gauss = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
+        gauss = gauss / gauss.sum()
+        sobel_x = xx * gauss
+        sobel_x = sobel_x / sobel_x.abs().sum()
+        sobel_y = yy * gauss
+        sobel_y = sobel_y / sobel_y.abs().sum()
+        lap = ((xx ** 2 + yy ** 2 - 2 * sigma ** 2) / sigma ** 4) * gauss
+        lap = lap / lap.abs().sum()
     f = torch.stack([sobel_x, sobel_y, lap])
     return f.repeat(state_dim, 1, 1).unsqueeze(1)
 
@@ -37,7 +59,7 @@ class LivingTissue:
                  replay_capacity=4000, replay_batch=192, replay_min_before_train=192,
                  predict_chem_only=False, si_enabled=False, si_lambda=1.0,
                  replay_prioritized=False, replay_priority_alpha=0.6,
-                 growth_fixed_threshold=None, inflammation_enabled=True):
+                 growth_fixed_threshold=None, inflammation_enabled=True, ctx_radius=1):
         """replay_*: буфер прошлых (контекст, цель) пар вместо обучения только
         на срезе текущего шага - без этого геном не сходится (найдено:
         error 1.07->1.19 за 300 шагов растущей ткани), потому что растущая
@@ -85,7 +107,8 @@ class LivingTissue:
         self.ema_decay, self.growth_ratio, self.decay_ratio = ema_decay, growth_ratio, decay_ratio
         self.stress_ema = torch.full((1, 1, size, size), 0.15)
 
-        self.ctx_kernels = _perception_kernels(state_dim)  # только sobel/lap - контекст соседей
+        self.ctx_radius = ctx_radius
+        self.ctx_kernels = _perception_kernels(state_dim, radius=ctx_radius)  # sobel/lap - контекст соседей
 
         # Единый геном - предсказывает СЕБЯ (identity) по КОНТЕКСТУ (соседи).
         # Zero backward - обучается той же PC-релаксацией, что уже проверена.
@@ -263,7 +286,8 @@ class LivingTissue:
         if sensory_signal is not None:
             state[:, 2:4] += sensory_signal * alive_before.float()
 
-        p_pad = F.pad(state, (1, 1, 1, 1), mode="circular")
+        r = self.ctx_radius
+        p_pad = F.pad(state, (r, r, r, r), mode="circular")
         ctx = F.conv2d(p_pad, self.ctx_kernels, groups=self.state_dim)  # (1, 3*state_dim, H, W)
 
         ys, xs = torch.where(alive_before[0, 0])
@@ -421,7 +445,8 @@ class LivingTissue:
         что скармливается геному в step(), доступный отдельно для внешнего
         анализа представлений."""
         alive, _ = self.alive_mask()
-        p_pad = F.pad(self.state, (1, 1, 1, 1), mode="circular")
+        r = self.ctx_radius
+        p_pad = F.pad(self.state, (r, r, r, r), mode="circular")
         ctx = F.conv2d(p_pad, self.ctx_kernels, groups=self.state_dim)
         ys, xs = torch.where(alive[0, 0])
         ctx_flat = ctx[0, :, ys, xs].T
