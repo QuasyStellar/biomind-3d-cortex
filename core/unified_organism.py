@@ -60,7 +60,7 @@ class LivingTissue:
                  predict_chem_only=False, si_enabled=False, si_lambda=1.0,
                  replay_prioritized=False, replay_priority_alpha=0.6,
                  growth_fixed_threshold=None, inflammation_enabled=True, ctx_radius=1,
-                 feedback_alignment=False):
+                 feedback_alignment=False, small_world_enabled=False):
         """replay_*: буфер прошлых (контекст, цель) пар вместо обучения только
         на срезе текущего шага - без этого геном не сходится (найдено:
         error 1.07->1.19 за 300 шагов растущей ткани), потому что растущая
@@ -111,12 +111,32 @@ class LivingTissue:
         self.ctx_radius = ctx_radius
         self.ctx_kernels = _perception_kernels(state_dim, radius=ctx_radius)  # sobel/lap - контекст соседей
 
+        # Small-world дальние аксоны (Watts & Strogatz 1998, проверено WebSearch -
+        # реальная, очень известная статья; см. CLAUDE_RESEARCH_SPEC.md M11, но
+        # НЕ принято на веру - критически перепроверено и реализовано с нуля).
+        # Диффузия через ctx_kernels даёт КАЖДОЙ клетке доступ только к radius-
+        # соседям за шаг - противоположные края холста физически не могут
+        # "увидеть" друг друга быстрее, чем за ~size/radius шагов (диффузионный
+        # барьер - совпадает с честно найденным этой же сессией: расширение
+        # radius САМОГО ЛОКАЛЬНОГО ядра не помогло, дважды перепроверено).
+        # Small-world - другой механизм: КАЖДАЯ клетка получает ОДИН
+        # ФИКСИРОВАННЫЙ случайный дальний "аксон" (не увеличивает локальное
+        # ядро, а даёт редкий прямой канал в произвольную точку холста) -
+        # драматически сокращает диаметр графа (Watts-Strogatz: O(N)->O(log N)
+        # уже при 10% дальних связей), не структурная переделка ядра.
+        self.small_world_enabled = small_world_enabled
+        if self.small_world_enabled:
+            gsw = torch.Generator().manual_seed(seed + 9001)
+            self.sw_target_y = torch.randint(0, size, (size, size), generator=gsw)
+            self.sw_target_x = torch.randint(0, size, (size, size), generator=gsw)
+
         # Единый геном - предсказывает СЕБЯ (identity) по КОНТЕКСТУ (соседи).
         # Zero backward - обучается той же PC-релаксацией, что уже проверена.
         self.predict_chem_only = predict_chem_only
         out_dim = (state_dim - 2) if predict_chem_only else state_dim
+        ctx_dim = state_dim * 4 if small_world_enabled else state_dim * 3
         self.genome = PredictiveCodingNet(
-            [state_dim * 3, genome_hidden, out_dim],
+            [ctx_dim, genome_hidden, out_dim],
             relax_steps=relax_steps, relax_lr=relax_lr, weight_lr=weight_lr,
             seed=seed, adam=True, weight_decay=0.02,
             si_enabled=si_enabled, si_lambda=si_lambda,
@@ -282,6 +302,11 @@ class LivingTissue:
             idx = torch.randint(0, limit, (k,), device=self._replay_ctx.device)
         return self._replay_ctx[idx], self._replay_target[idx]
 
+    def _small_world_gather(self, state):
+        """(1, state_dim, size, size) - каждая позиция (y,x) получает состояние
+        СВОЕГО фиксированного дальнего партнёра (sw_target_y/x), не соседа."""
+        return state[:, :, self.sw_target_y, self.sw_target_x]
+
     def step(self, sensory_signal=None, train_genome=True):
         alive_before, can_grow = self.alive_mask()
         state = self.state.clone()
@@ -291,13 +316,15 @@ class LivingTissue:
         r = self.ctx_radius
         p_pad = F.pad(state, (r, r, r, r), mode="circular")
         ctx = F.conv2d(p_pad, self.ctx_kernels, groups=self.state_dim)  # (1, 3*state_dim, H, W)
+        if self.small_world_enabled:
+            ctx = torch.cat([ctx, self._small_world_gather(state)], dim=1)  # (1, 4*state_dim, H, W)
 
         ys, xs = torch.where(alive_before[0, 0])
         n_alive = ys.shape[0]
         if n_alive == 0:
             return 0, 0.0
 
-        ctx_flat = ctx[0, :, ys, xs].T  # (n_alive, 3*state_dim)
+        ctx_flat = ctx[0, :, ys, xs].T  # (n_alive, 3*state_dim [+state_dim если small-world])
 
         # target: либо полный state (включая alive/stress "бухгалтерские"
         # каналы 0:2), либо только chemistry (2:) при predict_chem_only=True -
@@ -450,6 +477,8 @@ class LivingTissue:
         r = self.ctx_radius
         p_pad = F.pad(self.state, (r, r, r, r), mode="circular")
         ctx = F.conv2d(p_pad, self.ctx_kernels, groups=self.state_dim)
+        if self.small_world_enabled:
+            ctx = torch.cat([ctx, self._small_world_gather(self.state)], dim=1)
         ys, xs = torch.where(alive[0, 0])
         ctx_flat = ctx[0, :, ys, xs].T
         return ctx_flat, ys, xs
