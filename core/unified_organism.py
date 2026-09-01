@@ -48,6 +48,15 @@ class LivingTissue:
         self._replay_target = None
         self._replay_ptr = 0
         self._replay_full = False
+        self._step_count = 0
+        # Рост оценивается по СГЛАЖЕННОМУ (много медленнее, чем апоптоз) сигналу
+        # ошибки и применяется раз в growth_period шагов - развязка по скорости
+        # с обучением весов (каждый шаг), а не разделение на дискретные фазы.
+        # В реальном мозге структурная пластичность на порядки медленнее
+        # синаптической - это и моделируем, а не изобретаем произвольный костыль.
+        self.growth_ema_decay = 0.01
+        self.growth_period = 10
+        self.growth_ema = torch.full((1, 1, size, size), 0.15)
         self.size = size
         self.state_dim = state_dim
         self.dt = dt
@@ -185,21 +194,29 @@ class LivingTissue:
         # (высокой, т.к. геном не знает новый контекст) ошибкой, либо
         # обнуляет порог и делает рост ЕЩЁ агрессивнее. Апоптоз безопасен -
         # там EMA берётся у УЖЕ проживших хотя бы шаг клеток, без bootstrap-
-        # проблемы. Рост использует фиксированный порог 1.6 (выше пикового
-        # наблюдаемого раннего error ~1.46) - подобран экспериментально по
-        # трассировке (0.5 давало заливку всего холста за 20 шагов; 1.6
-        # даёт ограниченный, но не остановленный рост 13->30->85 за 150
-        # шагов). Это временное решение первой версии слияния, не финальная
-        # калибровка - самонастройка порога РОСТА (не только апоптоза) на
-        # основе ошибки предсказания остаётся открытой задачей.
+        # проблемы, использует быстрый ema_decay=0.05.
+        #
+        # ПЕРЕСМОТРЕНО по вопросу "не костыль ли wake/sleep-разделение?":
+        # реальная причина нестабильности - рост и обучение весов сидят на
+        # ОДНОМ тике, поэтому решение о делении клетки принимается по
+        # мгновенной, шумной ошибке ОДНОГО шага. В мозге структурная
+        # пластичность на порядки медленнее синаптической - разводим по
+        # СКОРОСТИ (медленная EMA + решение о росте раз в growth_period
+        # шагов), а не по дискретным day/night фазам, что было бы
+        # изобретённым под конкретный баг решением, а не биологически
+        # обоснованным.
         self.stress_ema = torch.where(alive_before, (1 - self.ema_decay) * self.stress_ema + self.ema_decay * stress_map, self.stress_ema)
+        self.growth_ema = torch.where(alive_before, (1 - self.growth_ema_decay) * self.growth_ema + self.growth_ema_decay * stress_map, self.growth_ema)
         die_th = self.stress_ema * self.decay_ratio
         grow_th_fixed = 1.6
+        self._step_count += 1
+        evaluate_growth = self.growth_enabled and (self._step_count % self.growth_period == 0)
 
-        if self.growth_enabled:
-            growth_signal = F.avg_pool2d((stress_map > grow_th_fixed).float(), 3, stride=1, padding=1)
+        if evaluate_growth:
+            growth_signal = F.avg_pool2d((self.growth_ema > grow_th_fixed).float(), 3, stride=1, padding=1)
             candidates = (growth_signal > 0.15) & can_grow & ~alive_before
             state[:, 0:1] = torch.where(candidates | alive_before, torch.ones_like(state[:, 0:1]), state[:, 0:1])
+        if self.growth_enabled:
             idle = (stress_map < die_th) & alive_before
             state[:, 0:1] = torch.where(idle, state[:, 0:1] * 0.9, state[:, 0:1])
 
