@@ -118,15 +118,19 @@ class LivingTissue:
         sdr[idx] = val
         return sdr / (sdr.norm() + 1e-7)
 
-    def add_modality(self, name, key_dim, sdr_dim=512, sparsity=0.08, seed=None):
+    def add_modality(self, name, key_dim, sdr_dim=512, sparsity=0.08, seed=None, value_dim=None):
         """Регистрирует независимую SDR-колонку для модальности `name`
         (свой dg_proj под свою размерность ключа, свой W - НЕ общий с
-        default/другими модальностями, как в Column из columnar_voting.py)."""
+        default/другими модальностями, как в Column из columnar_voting.py).
+        value_dim по умолчанию = fast_dim (химия клетки), но можно задать
+        другую размерность значения - нужно, например, для flat-baseline
+        в unified_vsa_compositional_sanity.py, где значения - VSA-векторы
+        произвольной размерности, не привязанные к химии ткани."""
         g = torch.Generator().manual_seed(seed if seed is not None else abs(hash(name)) % (2 ** 31))
         sdr_k = max(1, int(sdr_dim * sparsity))
         self.modalities[name] = {
             "dg_proj": torch.randn(sdr_dim, key_dim, generator=g) * (1.0 / key_dim ** 0.5),
-            "W": torch.zeros(self.fast_dim, sdr_dim),
+            "W": torch.zeros(value_dim if value_dim is not None else self.fast_dim, sdr_dim),
             "sdr_k": sdr_k,
         }
 
@@ -321,6 +325,42 @@ class LivingTissue:
         alive_after = state[:, 0:1] > 0.1
         self.state = state * alive_after.float()
         return int(alive_after.sum().item()), float(error_norm.mean().item())
+
+    # --- VSA-связывание, слито из vsa_binding.py (приоритет a): роль-заполнитель
+    # пары связываются через circular convolution (Plate 1995, ёмкостная кривая
+    # уже проверена отдельно до K=512 на dim=1024), суперпозиция нескольких пар
+    # пишется В SDR-память ОДНОЙ записью с приоритетом по метке (synaptic
+    # tagging, тоже уже проверено отдельно) - ВПЕРВЫЕ совмещены здесь, каждый
+    # компонент раньше тестировался только сам по себе. Значение bundle живёт
+    # в СВОЁМ пространстве (vsa_dim), не в fast_dim ткани (fast_dim=state_dim-2
+    # слишком мал для интересной ёмкости VSA) - отдельная W-матрица, не путать
+    # с add_modality (та привязана к fast_dim). ---
+    def init_vsa(self, vsa_dim=256, n_roles=16, sdr_dim=512, sparsity=0.08, seed=0):
+        from core.vsa_binding import random_vectors
+        self.vsa_dim = vsa_dim
+        self.vsa_roles = random_vectors(n_roles, vsa_dim, seed=seed)
+        g = torch.Generator().manual_seed(seed + 1)
+        self.vsa_sdr_k = max(1, int(sdr_dim * sparsity))
+        self.vsa_dg_proj = torch.randn(sdr_dim, vsa_dim, generator=g) * (1.0 / vsa_dim ** 0.5)
+        self.vsa_W = torch.zeros(vsa_dim, sdr_dim)
+
+    def write_compositional(self, slot_key, role_filler_pairs, tag_strength=1.0, beta=0.9):
+        """slot_key: ключ "объекта" (например, вектор сущности). role_filler_pairs:
+        [(role_idx, filler_vec), ...] - связываются через circular convolution и
+        суперпозируются в ОДИН bundle, пишется ОДНОЙ SDR-записью (не N отдельных)."""
+        from core.vsa_binding import circular_conv
+        bundle = torch.zeros(self.vsa_dim)
+        for role_idx, filler in role_filler_pairs:
+            bundle = bundle + circular_conv(self.vsa_roles[role_idx], filler)
+        s = self._sdr_code(slot_key, self.vsa_dg_proj, self.vsa_sdr_k)
+        pred = self.vsa_W @ s
+        err = bundle - pred
+        self.vsa_W += beta * tag_strength * torch.outer(err, s)
+
+    def read_compositional(self, slot_key, role_idx):
+        from core.vsa_binding import circular_corr
+        bundle = self.vsa_W @ self._sdr_code(slot_key, self.vsa_dg_proj, self.vsa_sdr_k)
+        return circular_corr(bundle, self.vsa_roles[role_idx])
 
     # --- JEPA-понимание, слито из jepa_understanding_sanity.py (приоритет a):
     # геном уже обучается self-supervised предсказанию себя по контексту
