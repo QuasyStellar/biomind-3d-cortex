@@ -35,7 +35,8 @@ class LivingTissue:
                  ema_decay=0.05, growth_ratio=1.4, decay_ratio=0.3,
                  genome_hidden=48, relax_steps=15, relax_lr=0.08, weight_lr=0.01,
                  replay_capacity=4000, replay_batch=192, replay_min_before_train=192,
-                 predict_chem_only=False, si_enabled=False, si_lambda=1.0):
+                 predict_chem_only=False, si_enabled=False, si_lambda=1.0,
+                 replay_prioritized=False, replay_priority_alpha=0.6):
         """replay_*: буфер прошлых (контекст, цель) пар вместо обучения только
         на срезе текущего шага - без этого геном не сходится (найдено:
         error 1.07->1.19 за 300 шагов растущей ткани), потому что растущая
@@ -47,8 +48,11 @@ class LivingTissue:
         self.replay_min_before_train = replay_min_before_train
         self._replay_ctx = None
         self._replay_target = None
+        self._replay_priority = None
         self._replay_ptr = 0
         self._replay_full = False
+        self.replay_prioritized = replay_prioritized
+        self.replay_priority_alpha = replay_priority_alpha
         self._step_count = 0
         # Рост оценивается по СГЛАЖЕННОМУ (много медленнее, чем апоптоз) сигналу
         # ошибки и применяется раз в growth_period шагов - развязка по скорости
@@ -185,19 +189,32 @@ class LivingTissue:
         can_grow = F.max_pool2d(alive.float(), 3, stride=1, padding=1) > 0.1
         return alive, can_grow
 
-    def _replay_push(self, ctx_flat, target_flat):
+    def _replay_push(self, ctx_flat, target_flat, priority=None):
         # device=ctx_flat.device - без этого буфер всегда создавался бы на CPU
         # даже если вся остальная ткань на CUDA, и падал бы с device mismatch
         # при первой же записи (найдено на Colab при повторных абляциях).
+        #
+        # priority (опционально, приоритет (c)/rule 2 - веб-поиск 2026-09-01:
+        # sharp-wave ripples в гиппокампе преимущественно реплеят СOЛЕВЕНТНЫЙ
+        # (высокая ошибка/новизна) опыт, не равномерно - тот же принцип, что
+        # Prioritized Experience Replay в RL) - если задан, пишется параллельно
+        # с ctx/target по той же индексации, чтобы _replay_sample могла сэмплить
+        # непропорционально по важности, а не строго равномерно.
         ctx_dim, target_dim = ctx_flat.shape[1], target_flat.shape[1]
         if self._replay_ctx is None:
             self._replay_ctx = torch.zeros(self.replay_capacity, ctx_dim, device=ctx_flat.device)
             self._replay_target = torch.zeros(self.replay_capacity, target_dim, device=ctx_flat.device)
+            if self.replay_prioritized:
+                self._replay_priority = torch.ones(self.replay_capacity, device=ctx_flat.device)
         n = ctx_flat.shape[0]
+        if priority is None and self.replay_prioritized:
+            priority = torch.ones(n, device=ctx_flat.device)
         if n >= self.replay_capacity:
             idx = torch.randperm(n, device=ctx_flat.device)[: self.replay_capacity]
             self._replay_ctx[:] = ctx_flat[idx].detach()
             self._replay_target[:] = target_flat[idx].detach()
+            if self.replay_prioritized:
+                self._replay_priority[:] = priority[idx].detach()
             self._replay_ptr = 0
             self._replay_full = True
             return
@@ -205,12 +222,17 @@ class LivingTissue:
         if end <= self.replay_capacity:
             self._replay_ctx[self._replay_ptr:end] = ctx_flat.detach()
             self._replay_target[self._replay_ptr:end] = target_flat.detach()
+            if self.replay_prioritized:
+                self._replay_priority[self._replay_ptr:end] = priority.detach()
         else:
             first = self.replay_capacity - self._replay_ptr
             self._replay_ctx[self._replay_ptr:] = ctx_flat[:first].detach()
             self._replay_target[self._replay_ptr:] = target_flat[:first].detach()
             self._replay_ctx[: n - first] = ctx_flat[first:].detach()
             self._replay_target[: n - first] = target_flat[first:].detach()
+            if self.replay_prioritized:
+                self._replay_priority[self._replay_ptr:] = priority[:first].detach()
+                self._replay_priority[: n - first] = priority[first:].detach()
             self._replay_full = True
         self._replay_ptr = end % self.replay_capacity
         if end >= self.replay_capacity:
@@ -220,7 +242,12 @@ class LivingTissue:
         limit = self.replay_capacity if self._replay_full else self._replay_ptr
         if limit == 0:
             return None, None
-        idx = torch.randint(0, limit, (min(batch_size, limit),), device=self._replay_ctx.device)
+        k = min(batch_size, limit)
+        if self.replay_prioritized:
+            p = self._replay_priority[:limit].clamp(min=1e-6) ** self.replay_priority_alpha
+            idx = torch.multinomial(p, k, replacement=True)
+        else:
+            idx = torch.randint(0, limit, (k,), device=self._replay_ctx.device)
         return self._replay_ctx[idx], self._replay_target[idx]
 
     def step(self, sensory_signal=None, train_genome=True):
@@ -247,7 +274,15 @@ class LivingTissue:
         else:
             target_flat = state[0, :, ys, xs].T  # (n_alive, state_dim)
 
-        self._replay_push(ctx_flat, target_flat)
+        if self.replay_prioritized:
+            # приоритет = ошибка ТЕКУЩЕГО генома на новых образцах (дешёвый
+            # inference-проход, не тренирует) - "солевентные"/неожиданные
+            # образцы будут чаще реплеиться позже (Prioritized Experience
+            # Replay, mirrors sharp-wave-ripple selectivity by novelty).
+            push_priority = (target_flat - self.genome.forward_pass(ctx_flat)).norm(dim=1) + 1e-3
+        else:
+            push_priority = None
+        self._replay_push(ctx_flat, target_flat, priority=push_priority)
         if train_genome:
             train_ctx, train_target = self._replay_sample(self.replay_batch)
             if train_ctx is not None and train_ctx.shape[0] >= self.replay_min_before_train:
