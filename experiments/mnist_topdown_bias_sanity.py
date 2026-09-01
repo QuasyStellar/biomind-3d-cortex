@@ -45,19 +45,32 @@ SUPERVISED_DIGITS = 400  # сколько цифр показать в фазе 
 SUPERVISED_K = 20        # шагов релаксации на цифру в этой фазе (веса УЧАТСЯ)
 
 
-def inject_label_broadcast(organism, label):
+def inject_label_broadcast(organism, label, localized=False, intensity=1.0):
     """Записывает one-hot метку НАПРЯМУЮ в state (не через sensory_signal,
     т.к. у state только 2 "сенсорных" канала 2:4 - метка получает СВОИ
-    каналы 4:14, отдельные от визуального сигнала, транслируется во ВСЕ
-    живые клетки холста, не только патч цифры - именно поэтому "top-down",
-    не локальный визуальный ввод)."""
+    каналы 4:14, отдельные от визуального сигнала).
+
+    localized=False (исходная версия - широковещательно по ВСЕМУ холсту,
+    дала 37.7%, ХУЖЕ baseline) vs localized=True (найдено по ходу - только
+    внутри патча цифры, не по всему холсту - гипотеза: broadcast-версия
+    была "слишком лёгкой" задачей, доминировавшей над визуальным сигналом,
+    локальная версия заставляет геном связывать метку ИМЕННО с локальным
+    визуальным контекстом, не просто копировать константу). intensity<1.0
+    - ослабленный сигнал, чтобы не доминировать над визуальным."""
     alive, _ = organism.alive_mask()
     onehot = torch.zeros(N_LABEL_CH)
-    onehot[label] = 1.0
-    organism.state[0, 4:4 + N_LABEL_CH] = onehot.view(N_LABEL_CH, 1, 1) * alive[0, 0].float()
+    onehot[label] = intensity
+    if localized:
+        mask = torch.zeros(1, organism.size, organism.size)
+        off = (organism.size - base.DIGIT_SIDE) // 2
+        mask[0, off:off + base.DIGIT_SIDE, off:off + base.DIGIT_SIDE] = 1.0
+        gate = alive[0, 0].float() * mask[0]
+    else:
+        gate = alive[0, 0].float()
+    organism.state[0, 4:4 + N_LABEL_CH] = onehot.view(N_LABEL_CH, 1, 1) * gate
 
 
-def run(seed=1, n_train=600, n_test=300):
+def run(seed=1, n_train=600, n_test=300, localized=False, intensity=1.0):
     tr_x, tr_y, te_x, te_y = load_mnist()
     torch.manual_seed(seed)
     organism = LivingTissue(size=base.SIZE, state_dim=16, seed=seed,
@@ -79,7 +92,7 @@ def run(seed=1, n_train=600, n_test=300):
     for count, i in enumerate(sup_idx):
         image, label = tr_x[i], tr_y[i].item()
         for _ in range(SUPERVISED_K):
-            inject_label_broadcast(organism, label)  # top-down: ДО шага, войдёт в контекст И в target
+            inject_label_broadcast(organism, label, localized=localized, intensity=intensity)
             organism.step(sensory_signal=base.digit_signal(image), train_genome=True)
         if (count + 1) % 100 == 0:
             print(f"  top-down обучение {count+1}/{SUPERVISED_DIGITS} ({time.time()-t0:.1f}s)")
