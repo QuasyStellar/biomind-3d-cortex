@@ -122,13 +122,16 @@ class LivingTissue:
         return alive, can_grow
 
     def _replay_push(self, ctx_flat, target_flat):
+        # device=ctx_flat.device - без этого буфер всегда создавался бы на CPU
+        # даже если вся остальная ткань на CUDA, и падал бы с device mismatch
+        # при первой же записи (найдено на Colab при повторных абляциях).
         ctx_dim, target_dim = ctx_flat.shape[1], target_flat.shape[1]
         if self._replay_ctx is None:
-            self._replay_ctx = torch.zeros(self.replay_capacity, ctx_dim)
-            self._replay_target = torch.zeros(self.replay_capacity, target_dim)
+            self._replay_ctx = torch.zeros(self.replay_capacity, ctx_dim, device=ctx_flat.device)
+            self._replay_target = torch.zeros(self.replay_capacity, target_dim, device=ctx_flat.device)
         n = ctx_flat.shape[0]
         if n >= self.replay_capacity:
-            idx = torch.randperm(n)[: self.replay_capacity]
+            idx = torch.randperm(n, device=ctx_flat.device)[: self.replay_capacity]
             self._replay_ctx[:] = ctx_flat[idx].detach()
             self._replay_target[:] = target_flat[idx].detach()
             self._replay_ptr = 0
@@ -153,7 +156,7 @@ class LivingTissue:
         limit = self.replay_capacity if self._replay_full else self._replay_ptr
         if limit == 0:
             return None, None
-        idx = torch.randint(0, limit, (min(batch_size, limit),))
+        idx = torch.randint(0, limit, (min(batch_size, limit),), device=self._replay_ctx.device)
         return self._replay_ctx[idx], self._replay_target[idx]
 
     def step(self, sensory_signal=None, train_genome=True):
@@ -198,7 +201,10 @@ class LivingTissue:
         # Реальный стресс = ошибка предсказания (не просто норма активности,
         # как раньше) - совпадает с дизайном morphogenetic_3d_cortex.py из
         # архива, который мы раньше признали архитектурно самым честным.
-        stress_map = torch.zeros(1, 1, self.size, self.size)
+        # device=state.device - без этого падает с device mismatch на CUDA
+        # (найдено на Colab при повторных абляциях - раньше не всплывало,
+        # т.к. первый Colab-тест организма был короче одного цикла).
+        stress_map = torch.zeros(1, 1, self.size, self.size, device=state.device)
         stress_map[0, 0, ys, xs] = error_norm
         state[:, 1:2] = stress_map
 
