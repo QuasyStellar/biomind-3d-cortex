@@ -33,8 +33,21 @@ def _perception_kernels(state_dim):
 class LivingTissue:
     def __init__(self, size=24, state_dim=16, seed=0, dt=0.4, growth_enabled=True,
                  ema_decay=0.05, growth_ratio=1.4, decay_ratio=0.3,
-                 genome_hidden=48, relax_steps=15, relax_lr=0.08, weight_lr=0.01):
+                 genome_hidden=48, relax_steps=15, relax_lr=0.08, weight_lr=0.01,
+                 replay_capacity=4000, replay_batch=192, replay_min_before_train=192):
+        """replay_*: буфер прошлых (контекст, цель) пар вместо обучения только
+        на срезе текущего шага - без этого геном не сходится (найдено:
+        error 1.07->1.19 за 300 шагов растущей ткани), потому что растущая
+        популяция клеток - постоянно меняющаяся, нестационарная обучающая
+        выборка. Тот же принцип, что и rehearsal-реплей в компоненте 3 (сон)."""
         g = torch.Generator().manual_seed(seed)
+        self.replay_capacity = replay_capacity
+        self.replay_batch = replay_batch
+        self.replay_min_before_train = replay_min_before_train
+        self._replay_ctx = None
+        self._replay_target = None
+        self._replay_ptr = 0
+        self._replay_full = False
         self.size = size
         self.state_dim = state_dim
         self.dt = dt
@@ -87,6 +100,41 @@ class LivingTissue:
         can_grow = F.max_pool2d(alive.float(), 3, stride=1, padding=1) > 0.1
         return alive, can_grow
 
+    def _replay_push(self, ctx_flat, target_flat):
+        ctx_dim, target_dim = ctx_flat.shape[1], target_flat.shape[1]
+        if self._replay_ctx is None:
+            self._replay_ctx = torch.zeros(self.replay_capacity, ctx_dim)
+            self._replay_target = torch.zeros(self.replay_capacity, target_dim)
+        n = ctx_flat.shape[0]
+        if n >= self.replay_capacity:
+            idx = torch.randperm(n)[: self.replay_capacity]
+            self._replay_ctx[:] = ctx_flat[idx].detach()
+            self._replay_target[:] = target_flat[idx].detach()
+            self._replay_ptr = 0
+            self._replay_full = True
+            return
+        end = self._replay_ptr + n
+        if end <= self.replay_capacity:
+            self._replay_ctx[self._replay_ptr:end] = ctx_flat.detach()
+            self._replay_target[self._replay_ptr:end] = target_flat.detach()
+        else:
+            first = self.replay_capacity - self._replay_ptr
+            self._replay_ctx[self._replay_ptr:] = ctx_flat[:first].detach()
+            self._replay_target[self._replay_ptr:] = target_flat[:first].detach()
+            self._replay_ctx[: n - first] = ctx_flat[first:].detach()
+            self._replay_target[: n - first] = target_flat[first:].detach()
+            self._replay_full = True
+        self._replay_ptr = end % self.replay_capacity
+        if end >= self.replay_capacity:
+            self._replay_full = True
+
+    def _replay_sample(self, batch_size):
+        limit = self.replay_capacity if self._replay_full else self._replay_ptr
+        if limit == 0:
+            return None, None
+        idx = torch.randint(0, limit, (min(batch_size, limit),))
+        return self._replay_ctx[idx], self._replay_target[idx]
+
     def step(self, sensory_signal=None, train_genome=True):
         alive_before, can_grow = self.alive_mask()
         state = self.state.clone()
@@ -108,8 +156,11 @@ class LivingTissue:
         # прогноза по ним - берём state[0,:,ys,xs] целиком для простоты формы).
         target_flat = state[0, :, ys, xs].T  # (n_alive, state_dim)
 
+        self._replay_push(ctx_flat, target_flat)
         if train_genome:
-            pred_error_energy = self.genome.train_step(ctx_flat, target_flat)
+            train_ctx, train_target = self._replay_sample(self.replay_batch)
+            if train_ctx is not None and train_ctx.shape[0] >= self.replay_min_before_train:
+                pred_error_energy = self.genome.train_step(train_ctx, train_target)
         pred = self.genome.forward_pass(ctx_flat)  # (n_alive, state_dim)
         error = target_flat - pred  # РЕАЛЬНАЯ ошибка предсказания на клетку
         error_norm = error.norm(dim=1)  # (n_alive,)
