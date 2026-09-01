@@ -36,7 +36,8 @@ class LivingTissue:
                  genome_hidden=48, relax_steps=15, relax_lr=0.08, weight_lr=0.01,
                  replay_capacity=4000, replay_batch=192, replay_min_before_train=192,
                  predict_chem_only=False, si_enabled=False, si_lambda=1.0,
-                 replay_prioritized=False, replay_priority_alpha=0.6):
+                 replay_prioritized=False, replay_priority_alpha=0.6,
+                 growth_fixed_threshold=None, inflammation_enabled=True):
         """replay_*: буфер прошлых (контекст, цель) пар вместо обучения только
         на срезе текущего шага - без этого геном не сходится (найдено:
         error 1.07->1.19 за 300 шагов растущей ткани), потому что растущая
@@ -62,6 +63,12 @@ class LivingTissue:
         self.growth_ema_decay = 0.01
         self.growth_period = 10
         self.growth_percentile = 85.0  # относительный, не абсолютный порог - см. step()
+        # M7 (docs/ROADMAP.md): для честного baseline нужен режим с ФИКСИРОВАННЫМ
+        # порогом роста (без percentile-самонастройки) и без воспаления - тот же
+        # механизм роста, но лишённый обеих адаптивных надстроек, проверяемых
+        # на систематическом масштабе против них.
+        self.growth_fixed_threshold = growth_fixed_threshold
+        self.inflammation_enabled = inflammation_enabled
         self.growth_ema = torch.full((1, 1, size, size), 0.15)
         # "Воспаление" - временный, локальный сигнал вокруг свежей раны,
         # понижающий порог роста именно там и затухающий со временем.
@@ -345,12 +352,18 @@ class LivingTissue:
             # Обходит и bootstrap-проблему новорождённых: они не участвуют в
             # вычислении процентиля (используются только alive_before клетки),
             # и не нуждаются в собственной истории для сравнения.
-            alive_growth_ema = self.growth_ema[alive_before]
-            if alive_growth_ema.numel() >= 4:
-                base_th = torch.quantile(alive_growth_ema, self.growth_percentile / 100.0)
+            if self.growth_fixed_threshold is not None:
+                base_th = torch.tensor(self.growth_fixed_threshold, device=self.growth_ema.device)
             else:
-                base_th = alive_growth_ema.mean() if alive_growth_ema.numel() > 0 else torch.tensor(1.0, device=self.growth_ema.device)
-            local_grow_th = base_th * (1.0 - self.inflammation_threshold_drop * self.inflammation)
+                alive_growth_ema = self.growth_ema[alive_before]
+                if alive_growth_ema.numel() >= 4:
+                    base_th = torch.quantile(alive_growth_ema, self.growth_percentile / 100.0)
+                else:
+                    base_th = alive_growth_ema.mean() if alive_growth_ema.numel() > 0 else torch.tensor(1.0, device=self.growth_ema.device)
+            if self.inflammation_enabled:
+                local_grow_th = base_th * (1.0 - self.inflammation_threshold_drop * self.inflammation)
+            else:
+                local_grow_th = base_th
             growth_signal = F.avg_pool2d((self.growth_ema > local_grow_th).float(), 3, stride=1, padding=1)
             candidates = (growth_signal > 0.15) & can_grow & ~alive_before
             state[:, 0:1] = torch.where(candidates | alive_before, torch.ones_like(state[:, 0:1]), state[:, 0:1])
