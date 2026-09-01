@@ -34,7 +34,8 @@ class LivingTissue:
     def __init__(self, size=24, state_dim=16, seed=0, dt=0.4, growth_enabled=True,
                  ema_decay=0.05, growth_ratio=1.4, decay_ratio=0.3,
                  genome_hidden=48, relax_steps=15, relax_lr=0.08, weight_lr=0.01,
-                 replay_capacity=4000, replay_batch=192, replay_min_before_train=192):
+                 replay_capacity=4000, replay_batch=192, replay_min_before_train=192,
+                 predict_chem_only=False):
         """replay_*: буфер прошлых (контекст, цель) пар вместо обучения только
         на срезе текущего шага - без этого геном не сходится (найдено:
         error 1.07->1.19 за 300 шагов растущей ткани), потому что растущая
@@ -68,8 +69,10 @@ class LivingTissue:
 
         # Единый геном - предсказывает СЕБЯ (identity) по КОНТЕКСТУ (соседи).
         # Zero backward - обучается той же PC-релаксацией, что уже проверена.
+        self.predict_chem_only = predict_chem_only
+        out_dim = (state_dim - 2) if predict_chem_only else state_dim
         self.genome = PredictiveCodingNet(
-            [state_dim * 3, genome_hidden, state_dim],
+            [state_dim * 3, genome_hidden, out_dim],
             relax_steps=relax_steps, relax_lr=relax_lr, weight_lr=weight_lr,
             seed=seed, adam=True, weight_decay=0.02)
 
@@ -160,10 +163,13 @@ class LivingTissue:
 
         ctx_flat = ctx[0, :, ys, xs].T  # (n_alive, 3*state_dim)
 
-        # genome выдаёт предсказание размерности state_dim (полное), сравниваем
-        # с полным state (включая alive/stress channel 0:2 как есть, без
-        # прогноза по ним - берём state[0,:,ys,xs] целиком для простоты формы).
-        target_flat = state[0, :, ys, xs].T  # (n_alive, state_dim)
+        # target: либо полный state (включая alive/stress "бухгалтерские"
+        # каналы 0:2), либо только chemistry (2:) при predict_chem_only=True -
+        # гипотеза: alive/stress добавляют нередуцируемый шум в цель предсказания.
+        if self.predict_chem_only:
+            target_flat = state[0, 2:, ys, xs].T  # (n_alive, state_dim-2)
+        else:
+            target_flat = state[0, :, ys, xs].T  # (n_alive, state_dim)
 
         self._replay_push(ctx_flat, target_flat)
         if train_genome:
@@ -176,7 +182,8 @@ class LivingTissue:
 
         # Обновляем chemistry - релаксация к тому, что контекст предсказывает
         # (движение к консенсусу соседей), плюс небольшой вклад W_fast.
-        new_chem = state[0, 2:, ys, xs].T + self.dt * (pred[:, 2:] - state[0, 2:, ys, xs].T)
+        pred_chem = pred if self.predict_chem_only else pred[:, 2:]
+        new_chem = state[0, 2:, ys, xs].T + self.dt * (pred_chem - state[0, 2:, ys, xs].T)
         state[0, 2:, ys, xs] = new_chem.T
 
         # Реальный стресс = ошибка предсказания (не просто норма активности,
