@@ -94,9 +94,18 @@ class TemporalPredictiveCoding:
         eps_y = y_k - self.C @ fx_final
         eps_x = x_hat_k - self.A @ x_prev_f - (self.B @ u if self.control else 0.0)
 
-        # Локальные Hebbian-обновления ПОСЛЕ схождения (eq. 11) - Sigma=I упрощение
+        # Локальные Hebbian-обновления ПОСЛЕ схождения (eq. 11) - Sigma=I упрощение.
+        # ИСПРАВЛЕНО (по прямой просьбе "перепроверь, может что-то не так сделал"):
+        # сверено с официальной референсной реализацией авторов
+        # (github.com/C16Mftang/temporal-predictive-coding, models.py) -
+        # delta_Wout = ex @ nonlin(z).T, НЕ ex @ z.T. Транскрипция уравнения
+        # 11 из текста статьи (первый WebFetch) ошибочно давала x_hat_k БЕЗ
+        # нелинейности для ΔC - код авторов (более надёжный источник, чем
+        # AI-пересказ HTML/PDF) использует f(x_hat_k) - ту же нелинейность,
+        # что и в eps_y/предсказании, симметрично с ΔA, который уже
+        # использовал f(x_prev) правильно.
         self.A += self.weight_lr * torch.outer(eps_x, x_prev_f)
-        self.C += self.weight_lr * torch.outer(eps_y, x_hat_k)
+        self.C += self.weight_lr * torch.outer(eps_y, fx_final)
         if self.control:
             self.B += self.weight_lr * torch.outer(eps_x, u)
 

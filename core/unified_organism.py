@@ -60,7 +60,7 @@ class LivingTissue:
                  predict_chem_only=False, si_enabled=False, si_lambda=1.0,
                  replay_prioritized=False, replay_priority_alpha=0.6,
                  growth_fixed_threshold=None, inflammation_enabled=True, ctx_radius=1,
-                 feedback_alignment=False, small_world_enabled=False):
+                 feedback_alignment=False, small_world_enabled=False, fire_rate=1.0):
         """replay_*: буфер прошлых (контекст, цель) пар вместо обучения только
         на срезе текущего шага - без этого геном не сходится (найдено:
         error 1.07->1.19 за 300 шагов растущей ткани), потому что растущая
@@ -125,6 +125,17 @@ class LivingTissue:
         # драматически сокращает диаметр графа (Watts-Strogatz: O(N)->O(log N)
         # уже при 10% дальних связей), не структурная переделка ядра.
         self.small_world_enabled = small_world_enabled
+        # fire_rate=1.0 (default, ВЕЗДЕ до сих пор) - каждая клетка обновляется
+        # КАЖДЫЙ шаг, полностью синхронно. Найдено по критическому аудиту
+        # (CLAUDE_RESEARCH_SPEC.md, слабость №9 "синхронный lock-step вместо
+        # асинхронности") И подтверждено прямым чтением референсного кода
+        # оригинальной Growing NCA (Mordvintsev et al. 2020,
+        # github.com/google-research/self-organising-systems): там
+        # `update_mask = random_uniform(...) <= fire_rate; x += dx*mask`,
+        # fire_rate=0.5 по умолчанию - КАЖДАЯ клетка обновляется только с
+        # некоторой вероятностью за шаг, не синхронно все сразу. Явное,
+        # проверенное в референсной реализации отличие, не выдумка.
+        self.fire_rate = fire_rate
         if self.small_world_enabled:
             gsw = torch.Generator().manual_seed(seed + 9001)
             self.sw_target_y = torch.randint(0, size, (size, size), generator=gsw)
@@ -354,7 +365,12 @@ class LivingTissue:
         # Обновляем chemistry - релаксация к тому, что контекст предсказывает
         # (движение к консенсусу соседей), плюс небольшой вклад W_fast.
         pred_chem = pred if self.predict_chem_only else pred[:, 2:]
-        new_chem = state[0, 2:, ys, xs].T + self.dt * (pred_chem - state[0, 2:, ys, xs].T)
+        old_chem = state[0, 2:, ys, xs].T
+        delta_chem = self.dt * (pred_chem - old_chem)
+        if self.fire_rate < 1.0:
+            fire_mask = (torch.rand(n_alive, device=state.device) < self.fire_rate).float().unsqueeze(1)
+            delta_chem = delta_chem * fire_mask
+        new_chem = old_chem + delta_chem
         state[0, 2:, ys, xs] = new_chem.T
 
         # Реальный стресс = ошибка предсказания (не просто норма активности,
