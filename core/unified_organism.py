@@ -215,7 +215,7 @@ class LivingTissue:
         self.stress_ema = torch.where(alive_before, (1 - self.ema_decay) * self.stress_ema + self.ema_decay * stress_map, self.stress_ema)
         self.growth_ema = torch.where(alive_before, (1 - self.growth_ema_decay) * self.growth_ema + self.growth_ema_decay * stress_map, self.growth_ema)
         die_th = self.stress_ema * self.decay_ratio
-        grow_th_fixed = 1.6
+        grow_th_fixed = 1.7
         self._step_count += 1
         evaluate_growth = self.growth_enabled and (self._step_count % self.growth_period == 0)
 
