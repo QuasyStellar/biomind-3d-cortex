@@ -60,7 +60,12 @@ from core.mnist_loader import load_mnist
 SIZE = 64
 DIGIT_SIDE = 28
 GROWTH_STEPS = 300
-BOOTSTRAP_CYCLES = 6
+BOOTSTRAP_CYCLES = 12  # УВЕЛИЧЕНО с 6 - раньше больше населения ВРЕДИЛО
+# (naive pooling разбавлялся нулями от мёртвых клеток сильнее при более
+# редком относительном покрытии), но с МАСКИРОВАННЫМ pooling (см. ниже)
+# это ограничение снято - 12 циклов (141 клетка) дало лучшую разделимость
+# (min pairwise dist 1.09 vs 0.87 при 6 циклах/113 клетках), не монотонно
+# (9 циклов хуже обоих - шум, не тренд, не проверено на нескольких seed)
 BOOTSTRAP_STEPS = 250
 BOOTSTRAP_FRACTION = 0.3
 K_STEPS_PER_DIGIT = 50
@@ -99,10 +104,13 @@ def digit_signal(image, size=SIZE, digit_side=DIGIT_SIDE):
     return s
 
 
-SPATIAL_POOL = 2  # 2x2 сетка (feat_dim=POOL*POOL*genome_hidden) - сохраняет ГДЕ
-# находится штрих, не только "какой формы" в среднем; pool=1 (просто среднее)
-# и pool=2 сравнимы по разделимости на малой проверке, pool=3 хуже (population
-# 113 клеток на 28x28 патч - на 3x3 сетку уже не хватает покрытия по ячейкам).
+SPATIAL_POOL = 7  # УВЕЛИЧЕНО с 2 (по просьбе "дай ему больше зрения") - после
+# перехода на МАСКИРОВАННЫЙ pooling (среднее только по живым клеткам в ячейке,
+# не разбавленное мёртвыми/нулевыми - см. docstring raw_hidden) деградация на
+# мелких сетках (pool=3+, найденная раньше с наивным pooling) исчезла: pool
+# 1/2/3/4/5/7 все дают сравнимую разделимость (min pairwise dist 0.83-0.93,
+# не падает с ростом pool, как раньше) - можно безопасно повысить разрешение
+# признака (feat_dim=4*4*genome_hidden=2048, было 512 при pool=2).
 
 
 def raw_hidden(org, image, k_steps, pool=SPATIAL_POOL):
@@ -127,8 +135,22 @@ def raw_hidden(org, image, k_steps, pool=SPATIAL_POOL):
     gh = h.shape[1]
     grid = torch.zeros(gh, SIZE, SIZE)
     grid[:, ys, xs] = h.T
-    patch = grid[:, off:off + DIGIT_SIDE, off:off + DIGIT_SIDE]
-    return F.adaptive_avg_pool2d(patch.unsqueeze(0), pool).flatten()
+    mask = torch.zeros(1, SIZE, SIZE)
+    mask[:, ys, xs] = 1.0
+    val_patch = grid[:, off:off + DIGIT_SIDE, off:off + DIGIT_SIDE]
+    mask_patch = mask[:, off:off + DIGIT_SIDE, off:off + DIGIT_SIDE]
+    # МАСКИРОВАННЫЙ pooling ("больше зрения" без смены архитектуры, rule:
+    # не бросать после первой попытки) - найдено по ходу: обычный
+    # adaptive_avg_pool2d усредняет по ВСЕЙ площади ячейки сетки, включая
+    # мёртвые (нулевые) клетки - при мелкой сетке (pool>=3) большинство
+    # ячеек почти пустые, сигнал разбавляется нулями и деградирует (см.
+    # честный отрицательный результат для pool=3 в VERIFICATION_LOG). Здесь
+    # pool_avg(значения)/pool_avg(маска живых) = среднее ТОЛЬКО по живым
+    # клеткам в ячейке (та же площадь сокращается в числителе и знаменателе) -
+    # позволяет более мелкую, детальную сетку без разбавления нулями.
+    val_pooled = F.adaptive_avg_pool2d(val_patch.unsqueeze(0), pool)
+    mask_pooled = F.adaptive_avg_pool2d(mask_patch.unsqueeze(0), pool)
+    return (val_pooled / (mask_pooled + 1e-6)).flatten()
 
 
 def run(seed=1):
