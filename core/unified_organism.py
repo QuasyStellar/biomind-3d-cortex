@@ -59,7 +59,8 @@ class LivingTissue:
                  replay_capacity=4000, replay_batch=192, replay_min_before_train=192,
                  predict_chem_only=False, si_enabled=False, si_lambda=1.0,
                  replay_prioritized=False, replay_priority_alpha=0.6,
-                 growth_fixed_threshold=None, inflammation_enabled=True, ctx_radius=1):
+                 growth_fixed_threshold=None, inflammation_enabled=True, ctx_radius=1,
+                 feedback_alignment=False):
         """replay_*: буфер прошлых (контекст, цель) пар вместо обучения только
         на срезе текущего шага - без этого геном не сходится (найдено:
         error 1.07->1.19 за 300 шагов растущей ткани), потому что растущая
@@ -118,7 +119,8 @@ class LivingTissue:
             [state_dim * 3, genome_hidden, out_dim],
             relax_steps=relax_steps, relax_lr=relax_lr, weight_lr=weight_lr,
             seed=seed, adam=True, weight_decay=0.02,
-            si_enabled=si_enabled, si_lambda=si_lambda)
+            si_enabled=si_enabled, si_lambda=si_lambda,
+            feedback_alignment=feedback_alignment)
 
         # Быстрая ассоциативная память - общая на всю ткань, symmetric delta-rule,
         # с SDR-разреженностью (компонент 2, уже проверено - плотная память без
