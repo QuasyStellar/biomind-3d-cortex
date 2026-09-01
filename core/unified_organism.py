@@ -387,6 +387,30 @@ class LivingTissue:
         z1 = ctx_flat @ self.genome.W[0].T + self.genome.b[0]
         return torch.tanh(z1)
 
+    # --- Phase-binding, слито из phase_binding.py (приоритет a, последний
+    # пункт из "колонки/JEPA/phase-binding"). Механизм проверен отдельно:
+    # математически корректен (идеальный случай - точная сегментация r=0),
+    # но качество на СЛУЧАЙНЫХ representations зависит от знака cos-сходства
+    # (см. VERIFICATION_LOG). Здесь - честный вопрос: у РЕАЛЬНОЙ, обученной
+    # PC-релаксацией химии ткани (не случайных векторов) естественно ли
+    # возникает нужная (не положительная) корреляция между РАЗНЫМИ областями,
+    # или это тоже нужно проектировать явно? ---
+    def init_phase(self, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        self.phase = 2 * torch.pi * torch.rand(self.size, self.size, generator=g)
+
+    def phase_sync_step(self, K=1.0, dt=0.1, sim_gate=True):
+        """Один шаг Kuramoto-релаксации по ЖИВЫМ клеткам, используя РЕАЛЬНУЮ
+        (обучаемую) химию ткани (state[0, 2:]) как основу сходства - не
+        синтетические векторы, как в изолированном phase_binding_sanity.py."""
+        from core.phase_binding import kuramoto_step
+        if not hasattr(self, "phase"):
+            self.init_phase()
+        alive, _ = self.alive_mask()
+        chem = self.state[0, 2:]
+        self.phase = kuramoto_step(chem, self.phase, alive[0, 0], K=K, dt=dt, sim_gate=sim_gate)
+        return self.phase
+
     # --- Быстрая память: приоритет по силе метки (synaptic tagging) ---
     def write_fact(self, key, value, tag_strength=1.0, beta=0.9):
         """tag_strength - сила метки (0..~2), пропорциональна новизне/ошибке
