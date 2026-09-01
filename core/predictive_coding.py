@@ -27,8 +27,18 @@ class PredictiveCodingNet:
     def __init__(self, dims, relax_steps=20, relax_lr=0.15, weight_lr=0.08, seed=0,
                  adam=True, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01,
                  homeostatic_gate=True, gate_fast=0.3, gate_slow=0.02,
-                 gate_shrink=0.9, gate_recover=1.02, gate_floor=0.05):
+                 gate_shrink=0.9, gate_recover=1.02, gate_floor=0.05, w0_mask=None):
         """dims: [in, hidden1, ..., out]. Всё в чистых тензорах, requires_grad=False.
+
+        w0_mask (dims[1], dims[0]) 0/1-маска на ПЕРВЫЙ слой - дендритная
+        компартментализация (веб-поиск 2026-09-01: "Dendritic Localized
+        Learning", ICML 2025 - локальные нелинейные дендритные ветви вместо
+        полносвязного слоя, биологически правдоподобнее). Каждый скрытый
+        нейрон получает вход только от СВОЕГО подмножества входов (например,
+        пространственный патч изображения), а не от всех - меньше эффективных
+        параметров, структура ближе к реальному дендритному дереву. Маска
+        применяется к градиенту КАЖДЫЙ шаг (не только при инициализации) -
+        иначе замаскированные веса "прорастут" обратно через Adam-момент.
         adam=True: тот же Adam, что и у backprop-baseline, но применяется к локально
         вычисленному градиенту (outer product ошибки и активности) — это оптимизатор,
         не backprop; сам градиент по-прежнему не требует .backward().
@@ -62,6 +72,9 @@ class PredictiveCodingNet:
             for l in range(self.L)
         ]
         self.b = [torch.zeros(dims[l + 1]) for l in range(self.L)]
+        self.w0_mask = w0_mask
+        if self.w0_mask is not None:
+            self.W[0] = self.W[0] * self.w0_mask
         if adam:
             self.mW = [torch.zeros_like(w) for w in self.W]
             self.vW = [torch.zeros_like(w) for w in self.W]
@@ -146,6 +159,8 @@ class PredictiveCodingNet:
             eps_l = xs[l + 1] - (act(z) if l < self.L - 1 else z)
             delta = eps_l if l == self.L - 1 else eps_l * act_deriv(z)
             gW = (delta.T @ xs[l]) / B
+            if l == 0 and self.w0_mask is not None:
+                gW = gW * self.w0_mask  # маскированные "дендритные" связи не растут через градиент
             gb = delta.mean(dim=0)
             if self.adam:
                 self._adam_step(self.W[l], gW, self.mW[l], self.vW[l], effective_lr)
