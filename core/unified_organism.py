@@ -97,15 +97,74 @@ class LivingTissue:
         self.dg_proj = torch.randn(sdr_dim, self.fast_dim, generator=g) * (1.0 / self.fast_dim ** 0.5)
         self.W_fast = torch.zeros(self.fast_dim, sdr_dim)
 
+        # Мультимодальная быстрая память (мердж columnar_voting.py в организм,
+        # приоритет (a) README/ROADMAP): каждая "колонка" - своя независимая
+        # SDR-память НА СВОЙ ключ-домен (одна и та же цель может быть записана
+        # разными сенсорными путями - например, из контекста ткани И из внешнего
+        # символьного ключа). Дефолтная W_fast/dg_proj выше остаются как есть
+        # (write_fact/read_fact - обратная совместимость с unified_organism_sanity.py),
+        # add_modality() добавляет ДОПОЛНИТЕЛЬНЫЕ независимые колонки.
+        self.modalities = {}
+
         self.state = torch.zeros(1, state_dim, size, size)
         self._seed_tissue()
 
-    def _sdr_code(self, key):
-        h = torch.relu(self.dg_proj @ key)
-        val, idx = torch.topk(h, self.sdr_k)
+    def _sdr_code(self, key, dg_proj=None, sdr_k=None):
+        proj = self.dg_proj if dg_proj is None else dg_proj
+        k = self.sdr_k if sdr_k is None else sdr_k
+        h = torch.relu(proj @ key)
+        val, idx = torch.topk(h, k)
         sdr = torch.zeros_like(h)
         sdr[idx] = val
         return sdr / (sdr.norm() + 1e-7)
+
+    def add_modality(self, name, key_dim, sdr_dim=512, sparsity=0.08, seed=None):
+        """Регистрирует независимую SDR-колонку для модальности `name`
+        (свой dg_proj под свою размерность ключа, свой W - НЕ общий с
+        default/другими модальностями, как в Column из columnar_voting.py)."""
+        g = torch.Generator().manual_seed(seed if seed is not None else abs(hash(name)) % (2 ** 31))
+        sdr_k = max(1, int(sdr_dim * sparsity))
+        self.modalities[name] = {
+            "dg_proj": torch.randn(sdr_dim, key_dim, generator=g) * (1.0 / key_dim ** 0.5),
+            "W": torch.zeros(self.fast_dim, sdr_dim),
+            "sdr_k": sdr_k,
+        }
+
+    def write_fact_modal(self, modality, key, value, tag_strength=1.0, beta=0.9):
+        m = self.modalities[modality]
+        s = self._sdr_code(key, m["dg_proj"], m["sdr_k"])
+        pred = m["W"] @ s
+        err = value - pred
+        m["W"] += beta * tag_strength * torch.outer(err, s)
+
+    def read_fact_modal(self, modality, key):
+        m = self.modalities[modality]
+        return m["W"] @ self._sdr_code(key, m["dg_proj"], m["sdr_k"])
+
+    def read_fact_voted(self, keys_by_modality):
+        """Слияние ЧТЕНИЙ нескольких колонок без ручных весов на модальность -
+        тот же принцип, что vote_consensus в columnar_voting.py (там - сумма
+        нормированных косинусных голосов по дискретным кандидатам), здесь
+        обобщено на НЕПРЕРЫВНОЕ значение: каждая активная модальность "голосует"
+        своим предсказанием, вес голоса = уверенность (норма предсказания) ЭТОЙ
+        колонки, нормированная по сумме - колонка с "пустой"/незаписанной
+        памятью (низкая норма) естественно вносит меньший вклад, без constant
+        per-modality весов, которые ломаются при добавлении новой модальности
+        (та же находка, что и в columnar_voting_sanity.py)."""
+        preds, weights = [], []
+        for name, key in keys_by_modality.items():
+            if name not in self.modalities:
+                continue
+            p = self.read_fact_modal(name, key)
+            preds.append(p)
+            weights.append(p.norm())
+        if not preds:
+            return torch.zeros(self.fast_dim)
+        w = torch.stack(weights)
+        if float(w.sum()) < 1e-7:
+            return torch.zeros_like(preds[0])
+        wn = w / w.sum()
+        return sum(p * wi for p, wi in zip(preds, wn))
 
     def _seed_tissue(self, radius=2):
         self.state.zero_()
