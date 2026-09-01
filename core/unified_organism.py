@@ -57,6 +57,7 @@ class LivingTissue:
         # синаптической - это и моделируем, а не изобретаем произвольный костыль.
         self.growth_ema_decay = 0.01
         self.growth_period = 10
+        self.growth_percentile = 85.0  # относительный, не абсолютный порог - см. step()
         self.growth_ema = torch.full((1, 1, size, size), 0.15)
         # "Воспаление" - временный, локальный сигнал вокруг свежей раны,
         # понижающий порог роста именно там и затухающий со временем.
@@ -223,15 +224,28 @@ class LivingTissue:
         self.stress_ema = torch.where(alive_before, (1 - self.ema_decay) * self.stress_ema + self.ema_decay * stress_map, self.stress_ema)
         self.growth_ema = torch.where(alive_before, (1 - self.growth_ema_decay) * self.growth_ema + self.growth_ema_decay * stress_map, self.growth_ema)
         die_th = self.stress_ema * self.decay_ratio
-        grow_th_fixed = 1.7
         self._step_count += 1
         evaluate_growth = self.growth_enabled and (self._step_count % self.growth_period == 0)
 
         # Воспаление затухает каждый шаг (временное, не постоянное).
         self.inflammation = self.inflammation * self.inflammation_decay
-        local_grow_th = grow_th_fixed * (1.0 - self.inflammation_threshold_drop * self.inflammation)
 
         if evaluate_growth:
+            # PERCENTILE-порог вместо абсолютной константы (найдено на Colab:
+            # константа 1.7, откалиброванная на холсте 24x24, вообще не
+            # запускала рост на 128x128 - фиксированные числа не масштабируются).
+            # Порог = N-й процентиль РЕАЛЬНОГО распределения growth_ema среди
+            # ЖИВЫХ клеток прямо сейчас - самонастраивается под любой масштаб
+            # и любую статистику ошибки автоматически, без магической константы.
+            # Обходит и bootstrap-проблему новорождённых: они не участвуют в
+            # вычислении процентиля (используются только alive_before клетки),
+            # и не нуждаются в собственной истории для сравнения.
+            alive_growth_ema = self.growth_ema[alive_before]
+            if alive_growth_ema.numel() >= 4:
+                base_th = torch.quantile(alive_growth_ema, self.growth_percentile / 100.0)
+            else:
+                base_th = alive_growth_ema.mean() if alive_growth_ema.numel() > 0 else torch.tensor(1.0, device=self.growth_ema.device)
+            local_grow_th = base_th * (1.0 - self.inflammation_threshold_drop * self.inflammation)
             growth_signal = F.avg_pool2d((self.growth_ema > local_grow_th).float(), 3, stride=1, padding=1)
             candidates = (growth_signal > 0.15) & can_grow & ~alive_before
             state[:, 0:1] = torch.where(candidates | alive_before, torch.ones_like(state[:, 0:1]), state[:, 0:1])
